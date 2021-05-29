@@ -53,7 +53,7 @@ func addrFromStun(conn *net.UDPConn) (string, error) {
 	return xorAddr.String(), nil
 }
 
-// PrefixStringWithLen : prefixes a string with its length, for use with ReadPrefixedStringWithLen
+// prefixStringWithLen: prefixes a string with its length, for use with ReadPrefixedStringWithLen
 // fails if len(s) == 0
 func prefixStringWithLen(s string) []byte {
 	if len(s) == 0 {
@@ -64,7 +64,7 @@ func prefixStringWithLen(s string) []byte {
 	return append(buf, []byte(s)...)
 }
 
-// ReadLenPrefixedString : reads in a string from the reader assuming that the first 4 bytes
+// readLenPrefixedString: reads in a string from the reader assuming that the first 4 bytes
 // are the length of the string
 func readLenPrefixedString(r io.Reader) (string, error) {
 	buf := make([]byte, 4)

@@ -112,19 +112,23 @@ func recvPeerID(listenSess quic.Session) (quic.Stream, string, error) {
 }
 
 func syncPeerSessions(dialSess quic.Session, listenSess quic.Session) (quic.Session, quic.Stream, error) {
+	// generate random peerID to tiebreak which session to keep
 	peerID := strconv.FormatUint(rand.Uint64(), 16)
+	// try to open two streams. we need at least one to work
 	dialStream, errDial := sendPeerID(peerID, dialSess)
 	listenStream, remotePeerID, errListen := recvPeerID(listenSess)
 	if errDial != nil && errListen != nil {
 		return nil, nil, fmt.Errorf("unable to open dial stream or listen stream: %s %s", errDial, errListen)
 	}
 	if errDial == nil && errListen == nil {
+		// in case the session is from a very slow peer on a previous connection attempt
 		if dialSess.RemoteAddr().String() != listenSess.RemoteAddr().String() {
 			return nil, nil, fmt.Errorf(
 				"dial/listen remote addresses do not match: %s %s",
 				dialSess.RemoteAddr(), listenSess.RemoteAddr(),
 			)
 		}
+		// decide which session/stream to keep
 		if peerID > remotePeerID {
 			listenStream.Close()
 			listenSess.CloseWithError(ERR_PEER_INITIATOR, "Peer has decided it is the initiator")
@@ -135,12 +139,14 @@ func syncPeerSessions(dialSess quic.Session, listenSess quic.Session) (quic.Sess
 			return listenSess, listenStream, nil
 		}
 	}
+	// only reached if one side has symmetric NAT, or if one of the connections were dropped (not likely)
 	if errDial != nil {
 		return dialSess, dialStream, nil
 	}
 	if errListen != nil {
 		return listenSess, dialStream, nil
 	}
+	// should never get to here. either my errors were not checked correctly or some library error occurred
 	log.Fatal("unknown case reached")
 	return nil, nil, errors.New("unknown case reached")
 }
@@ -195,15 +201,18 @@ func SimpleHolepunch(msg string, timeout time.Duration) error {
 				break outer
 			}
 		}
+		// pick a session to keep
 		sess, stream, err := syncPeerSessions(dialSess, listenSess)
 		if err != nil {
 			return err
 		}
 		fmt.Println("Session established with", sess.RemoteAddr())
+		// send our message
 		_, err = stream.Write(prefixStringWithLen(msg))
 		if err != nil {
 			return err
 		}
+		// receive their message
 		peerMsg, err := readLenPrefixedString(stream)
 		if err != nil {
 			return err
