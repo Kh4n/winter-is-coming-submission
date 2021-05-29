@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"time"
 
 	swarm "github.com/Kh4n/winter-is-coming-submission"
 )
@@ -13,5 +14,5 @@ func main() {
 	if *msg == "" {
 		log.Fatal("You must provide a message for the other peer")
 	}
-	log.Fatal(swarm.SimpleHolepunch(*msg))
+	log.Fatal(swarm.SimpleHolepunch(*msg, time.Second*20))
 }

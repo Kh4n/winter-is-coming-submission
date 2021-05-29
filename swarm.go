@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,10 +57,10 @@ func handleIncomingSessions(sessions chan<- quic.Session, conn *net.UDPConn, tls
 }
 
 // Dials peerAddr, which initiates the holepunch
-func tryDialHolepunch(conn *net.UDPConn, peerAddr string, tlsConf *tls.Config) (quic.Session, error) {
+func tryDialHolepunch(sessions chan<- quic.Session, conn *net.UDPConn, peerAddr string, tlsConf *tls.Config) {
 	addr, err := net.ResolveUDPAddr("udp4", peerAddr)
 	if err != nil {
-		return nil, err
+		log.Fatal("Could not resolve address:", err)
 	}
 	var (
 		sess quic.Session = nil
@@ -71,13 +74,79 @@ func tryDialHolepunch(conn *net.UDPConn, peerAddr string, tlsConf *tls.Config) (
 		time.Sleep(200 * time.Millisecond)
 	}
 	if err != nil {
-		return nil, err
+		log.Println("Could not dial address:", err)
+		sessions <- nil
+		return
 	}
-	return sess, nil
+	sessions <- sess
 }
 
-// Will send msg to peer to prove connectivity
-func SimpleHolepunch(msg string) error {
+func sendPeerID(peerID string, dialSess quic.Session) (quic.Stream, error) {
+	if dialSess == nil {
+		return nil, fmt.Errorf("dialSess is nil")
+	}
+	dialStream, err := dialSess.OpenStream()
+	if err != nil {
+		return nil, fmt.Errorf("unable to open dial stream with peer: %s", err)
+	}
+	_, err = dialStream.Write(prefixStringWithLen(peerID))
+	if err != nil {
+		return nil, fmt.Errorf("unable to write to dial stream with peer: %s", err)
+	}
+	return dialStream, nil
+}
+
+func recvPeerID(listenSess quic.Session) (quic.Stream, string, error) {
+	if listenSess == nil {
+		return nil, "", fmt.Errorf("listenSess is nil")
+	}
+	listenStream, err := listenSess.AcceptStream(context.Background())
+	if err != nil {
+		return nil, "", fmt.Errorf("unable to accept listen stream with peer: %s", err)
+	}
+	remotePeerID, err := readLenPrefixedString(listenStream)
+	if err != nil {
+		return nil, "", fmt.Errorf("unable to read listen stream with peer: %s", err)
+	}
+	return listenStream, remotePeerID, nil
+}
+
+func syncPeerSessions(dialSess quic.Session, listenSess quic.Session) (quic.Session, quic.Stream, error) {
+	peerID := strconv.FormatUint(rand.Uint64(), 16)
+	dialStream, errDial := sendPeerID(peerID, dialSess)
+	listenStream, remotePeerID, errListen := recvPeerID(listenSess)
+	if errDial != nil && errListen != nil {
+		return nil, nil, fmt.Errorf("unable to open dial stream or listen stream: %s %s", errDial, errListen)
+	}
+	if errDial == nil && errListen == nil {
+		if dialSess.RemoteAddr().String() != listenSess.RemoteAddr().String() {
+			return nil, nil, fmt.Errorf(
+				"dial/listen remote addresses do not match: %s %s",
+				dialSess.RemoteAddr(), listenSess.RemoteAddr(),
+			)
+		}
+		if peerID > remotePeerID {
+			listenStream.Close()
+			listenSess.CloseWithError(ERR_PEER_INITIATOR, "Peer has decided it is the initiator")
+			return dialSess, dialStream, nil
+		} else {
+			dialStream.Close()
+			dialSess.CloseWithError(ERR_PEER_NOT_INITIATOR, "Peer has decided it is not the initiator")
+			return listenSess, listenStream, nil
+		}
+	}
+	if errDial != nil {
+		return dialSess, dialStream, nil
+	}
+	if errListen != nil {
+		return listenSess, dialStream, nil
+	}
+	log.Fatal("unknown case reached")
+	return nil, nil, errors.New("unknown case reached")
+}
+
+// Will send msg to peer to prove connectivity. Gives up after timeout
+func SimpleHolepunch(msg string, timeout time.Duration) error {
 	conn, err := setupRandomUDP()
 	if err != nil {
 		return err
@@ -95,44 +164,47 @@ func SimpleHolepunch(msg string) error {
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quic-holepunch"},
 	}
-	sessions := make(chan quic.Session)
-	go handleIncomingSessions(sessions, conn, tlsConf)
+	inSessions := make(chan quic.Session)
+	go handleIncomingSessions(inSessions, conn, tlsConf)
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("Enter remote peer address (with port): ")
-		addr, err := reader.ReadString('\n')
+		peerAddr, err := reader.ReadString('\n')
 		if err != nil {
 			return err
 		}
-		addr = strings.Trim(addr, "\n\r\t ")
+		peerAddr = strings.Trim(peerAddr, "\n\r\t ")
 		fmt.Println("Connecting to peer...")
 		// both sides have to dial in order to holepunch
-		// there are two options for connectivity
-		// 1. open two sessions and keep both
-		// 2. only keep one, the peers need to sync up and choose which to keep
-		// the first method is simpler, but possibly wasteful
-		// the second is more complex but keeps everything in one session
-		// I have gone with the first option in an effort to keep code simple
-		dialSess, err := tryDialHolepunch(conn, addr, tlsConf)
+		// guaranteed connectivity requires you to be flexible
+		// you must be able to handle cases where only one side connects (ie. Symmetric NAT <-> Normal NAT)
+		outSessions := make(chan quic.Session, 1)
+		go tryDialHolepunch(outSessions, conn, peerAddr, tlsConf)
+		var dialSess, listenSess quic.Session
+		giveup := time.After(timeout)
+		// this is ugly ill admit, I do not know a better way
+		// basically we are waiting for at least one to finish, barring the timeout
+	outer:
+		for i := 0; i < 2; i += 1 {
+			select {
+			case dialSess = <-outSessions:
+				log.Println("Successfully dialed peer")
+			case listenSess = <-inSessions:
+				log.Println("Successfully received connection")
+			case <-giveup:
+				break outer
+			}
+		}
+		sess, stream, err := syncPeerSessions(dialSess, listenSess)
 		if err != nil {
 			return err
 		}
-		outStream, err := dialSess.OpenUniStream()
+		fmt.Println("Session established with", sess.RemoteAddr())
+		_, err = stream.Write(prefixStringWithLen(msg))
 		if err != nil {
 			return err
 		}
-		_, err = outStream.Write(prefixStringWithLen(msg))
-		if err != nil {
-			return err
-		}
-		listenSess := <-sessions
-		fmt.Println("Session established with", addr)
-		inStream, err := listenSess.AcceptUniStream(context.Background())
-		if err != nil {
-			return err
-		}
-		// ultra simple protocol: length prefixed strings
-		peerMsg, err := readLenPrefixedString(inStream)
+		peerMsg, err := readLenPrefixedString(stream)
 		if err != nil {
 			return err
 		}
